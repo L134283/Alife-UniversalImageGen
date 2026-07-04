@@ -73,9 +73,6 @@ public class UniversalImageGen(
 
             若当前在 QQ 聊天环境中，生图完成后直接用以下标签将图片发送到 QQ：
             <qimage image="{{saveDir}}/文件名.后缀" />
-
-            ## 提供工具
-            {{handler.FunctionDocument()}}
             """);
     }
 
