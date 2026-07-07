@@ -27,7 +27,7 @@ public class UniversalImageGen(
     XmlFunctionCaller functionService
 ) : InteractiveModule<UniversalImageGen>, IConfigurable<UniversalImageGenConfig>
 {
-    private static readonly HttpClient _http = new(new HttpClientHandler { UseProxy = false })
+    private static readonly HttpClient _http = new()
         { Timeout = TimeSpan.FromSeconds(180) };
 
     private static readonly HttpClient _dlHttp = new()
@@ -298,15 +298,23 @@ public class UniversalImageGen(
 
     async Task<byte[]?> DownloadImageAsync(string url)
     {
-        // data: URI 直接解析 base64
+        // data: URI 解析
         if (url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
         {
             try
             {
                 var comma = url.IndexOf(',');
                 if (comma < 0) return null;
-                var b64 = url.Substring(comma + 1);
-                var data = Convert.FromBase64String(b64);
+                var dataPart = url.Substring(comma + 1);
+                byte[] data;
+                try
+                {
+                    data = Convert.FromBase64String(dataPart);
+                }
+                catch
+                {
+                    data = Encoding.UTF8.GetBytes(Uri.UnescapeDataString(dataPart));
+                }
                 Log($"从 data: URI 解析 ({data.Length / 1024.0:F0}KB)");
                 return data;
             }
@@ -364,11 +372,14 @@ public class UniversalImageGen(
     {
         try
         {
-            var uri = new Uri(url);
-            var path = uri.AbsolutePath;
-            var ext = Path.GetExtension(path)?.ToLowerInvariant();
-            if (ext is ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif" or ".bmp")
-                return ext == ".jpeg" ? ".jpg" : ext;
+            if (!url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                var uri = new Uri(url);
+                var path = uri.AbsolutePath;
+                var ext = Path.GetExtension(path)?.ToLowerInvariant();
+                if (ext is ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif" or ".bmp")
+                    return ext == ".jpeg" ? ".jpg" : ext;
+            }
         }
         catch { }
 
@@ -412,7 +423,7 @@ public class UniversalImageGen(
             var msg = new JsonObject { ["role"] = "user" };
             if (imgPath != null)
             {
-                var b64 = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
+                var b64data = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
                 var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
                 msg["content"] = new JsonArray
                 {
@@ -420,7 +431,7 @@ public class UniversalImageGen(
                     new JsonObject
                     {
                         ["type"] = "image_url",
-                        ["image_url"] = new JsonObject { ["url"] = $"data:image/{ext};base64,{b64}" }
+                        ["image_url"] = new JsonObject { ["url"] = $"data:image/{ext};base64,{b64data}" }
                     }
                 };
             }
@@ -447,9 +458,9 @@ public class UniversalImageGen(
 
             if (imgPath != null)
             {
-                var b64 = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
+                var b64img = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
                 var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
-                body["image"] = $"data:image/{ext};base64,{b64}";
+                body["image"] = $"data:image/{ext};base64,{b64img}";
             }
 
             req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
@@ -481,9 +492,9 @@ public class UniversalImageGen(
             {
                 foreach (var item in arr)
                 {
-                    var url = item?["image_url"]?["url"]?.GetValue<string>();
-                    if (!string.IsNullOrWhiteSpace(url))
-                        return url;
+                    var imgUrl = item?["image_url"]?["url"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(imgUrl))
+                        return imgUrl;
                 }
             }
             var text = content?.GetValue<string>();
@@ -500,13 +511,22 @@ public class UniversalImageGen(
             var altUrl = node["data"]?[0]?["url"]?.GetValue<string>();
             if (!string.IsNullOrWhiteSpace(altUrl))
                 return altUrl;
+            altUrl = node["data"]?[0]?["b64_json"]?.GetValue<string>();
+            if (!string.IsNullOrWhiteSpace(altUrl))
+                return $"data:image/png;base64,{altUrl}";
             // 显示前 300 字符用于诊断
             var preview = raw.Length > 300 ? raw[..300] + "..." : raw;
             Log($"chat 响应未找到图片链接: {preview}");
             return null;
         }
 
-        return node["data"]?[0]?["url"]?.GetValue<string>();
+        var url = node["data"]?[0]?["url"]?.GetValue<string>();
+        if (!string.IsNullOrWhiteSpace(url))
+            return url;
+        var b64 = node["data"]?[0]?["b64_json"]?.GetValue<string>();
+        if (!string.IsNullOrWhiteSpace(b64))
+            return $"data:image/png;base64,{b64}";
+        return null;
     }
 
     async Task<string?> CallAgnesAsync(string endpoint, string key, string model, string prompt, string? imgPath, string size)
@@ -548,7 +568,13 @@ public class UniversalImageGen(
         }
 
         var node = JsonNode.Parse(raw);
-        return node?["data"]?[0]?["url"]?.GetValue<string>();
+        if (node == null) return null;
+        var agUrl = node["data"]?[0]?["url"]?.GetValue<string>();
+        if (!string.IsNullOrWhiteSpace(agUrl)) return agUrl;
+        var agB64 = node["data"]?[0]?["b64_json"]?.GetValue<string>();
+        if (!string.IsNullOrWhiteSpace(agB64))
+            return $"data:image/png;base64,{agB64}";
+        return null;
     }
 
     async Task<string?> CallWanAsync(string endpoint, string key, string model, string prompt, string? imgPath, string size)
