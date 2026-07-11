@@ -90,3 +90,42 @@ UI 提供一键预设按钮：
 ## 致谢
 
 本插件功能实现由 **初心、爱奈丽** 完成，本人仅做集成优化和插件化封装。
+
+## 更新日志
+
+### v1.1.0 (2026-07-11)
+
+**代码优化**
+- 提取 `ReadImageAsDataUriAsync` / `SendRequestAsync` 公共方法，消除 3 处 base64 编码和 HTTP 发送重复代码
+- 重试延迟从固定 2s 改为指数退避（2s → 4s → 6s）
+- 参考图下载改存系统临时目录，API 调用完成后自动清理
+- `DetectExtensionAsync` 改为同步方法 `DetectExtension`（内部无异步操作）
+- `ContentLength` nullable 检查显式化
+
+**UI 重构 — 粉色主题**
+- 全新粉色渐变主题，流光标题动画、脉冲状态徽标、悬浮发光按钮
+- 折叠组 hover 升起 + 发光阴影 + 箭头旋转动画
+- CSS 覆盖 AntDesign Input / InputPassword / RadioGroup 染粉
+- 移除有类型转换问题的 Alert / Divider / Button / Tag，改用自定义 HTML + CSS
+
+### v1.0.3 (2026-07-07)
+
+- 移除 UseProxy 直连限制，走系统代理
+- Agnes API 新增 b64_json 降级兼容
+- data: URI 支持非 base64 格式
+- 修复 data: URI 导致 DetectExtensionAsync 崩溃
+
+### v1.0.2 (2026-07-04)
+
+- 修复系统提示词中函数文档重复注入
+
+### v1.0.1 (2026-06-27)
+
+- 新增 OpenAI Chat Completions 格式支持
+- 生图发出后不阻塞 AI
+- 智能重试（4xx 不重试，5xx 重试 3 次）
+- 修复多个 bug
+
+### v1.0.0 (2026-06-27)
+
+- 初始版本
