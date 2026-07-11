@@ -170,8 +170,8 @@ public class UniversalImageGen(
 
         Directory.CreateDirectory(saveDir);
 
-        // 处理参考图（支持 URL 和本地路径）
-        var effectiveImgPath = await PrepareReferenceImageAsync(imgPath, saveDir);
+        // 处理参考图（支持 URL 和本地路径），URL 参考图下载到临时目录
+        var (effectiveImgPath, isTempRef) = await PrepareReferenceImageAsync(imgPath);
 
         try
         {
@@ -202,20 +202,16 @@ public class UniversalImageGen(
                 catch (HttpRequestException ex) when (ex.StatusCode.HasValue && (int)ex.StatusCode.Value < 500)
                 {
                     Log($"请求错误 ({(int)ex.StatusCode.Value})");
-                    if (attempt >= maxRetries)
-                        throw;
-                    if (attempt < maxRetries)
-                        Log($"重试 ({attempt + 1}/{maxRetries})...");
-                    await Task.Delay(2000);
+                    if (attempt >= maxRetries) throw;
+                    Log($"重试 ({attempt + 1}/{maxRetries})...");
+                    await Task.Delay(2000 * attempt);
                 }
                 catch (Exception ex)
                 {
                     Log($"连接失败: {ex.Message}");
-                    if (attempt >= maxRetries)
-                        throw;
-                    if (attempt < maxRetries)
-                        Log($"重试 ({attempt + 1}/{maxRetries})...");
-                    await Task.Delay(2000);
+                    if (attempt >= maxRetries) throw;
+                    Log($"重试 ({attempt + 1}/{maxRetries})...");
+                    await Task.Delay(2000 * attempt);
                 }
             }
 
@@ -231,7 +227,7 @@ public class UniversalImageGen(
             if (imgData == null)
                 return;
 
-            var ext = await DetectExtensionAsync(imageUrl, imgData);
+            var ext = DetectExtension(imageUrl, imgData);
             var fileName = $"universal_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext}";
             var savePath = Path.Combine(saveDir, fileName);
             await File.WriteAllBytesAsync(savePath, imgData);
@@ -252,14 +248,23 @@ public class UniversalImageGen(
             Log($"生成异常: {ex.Message}");
             Poke($"生成失败: {ex.Message}");
         }
+        finally
+        {
+            // 清理临时参考图
+            if (isTempRef && effectiveImgPath != null)
+            {
+                try { if (File.Exists(effectiveImgPath)) File.Delete(effectiveImgPath); }
+                catch { /* 忽略临时文件清理失败 */ }
+            }
+        }
     }
 
-    async Task<string?> PrepareReferenceImageAsync(string? imgPath, string saveDir)
+    async Task<(string? path, bool isTemp)> PrepareReferenceImageAsync(string? imgPath)
     {
         if (string.IsNullOrWhiteSpace(imgPath))
-            return null;
+            return (null, false);
 
-        // URL 参考图：下载到保存目录
+        // URL 参考图：下载到临时目录（调用完成后自动清理）
         if (imgPath.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
             imgPath.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
@@ -270,30 +275,30 @@ public class UniversalImageGen(
                 if (imgData == null)
                 {
                     Log($"参考图下载失败");
-                    return null;
+                    return (null, false);
                 }
 
-                var ext = await DetectExtensionAsync(imgPath, imgData);
+                var ext = DetectExtension(imgPath, imgData);
                 var refName = $"ref_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext}";
-                var refPath = Path.Combine(saveDir, refName);
+                var refPath = Path.Combine(Path.GetTempPath(), refName);
                 await File.WriteAllBytesAsync(refPath, imgData);
                 Log($"参考图已缓存 ({imgData.Length / 1024.0:F0}KB) -> {refName}");
-                return refPath;
+                return (refPath, true);
             }
             catch (Exception ex)
             {
                 Log($"参考图下载失败: {ex.Message}");
-                return null;
+                return (null, false);
             }
         }
 
         // 本地路径
         if (File.Exists(imgPath))
-            return imgPath;
+            return (imgPath, false);
 
         Log($"参考图不存在: {imgPath}");
         Poke($"图片文件不存在 ({imgPath})，将以文生图模式生成");
-        return null;
+        return (null, false);
     }
 
     async Task<byte[]?> DownloadImageAsync(string url)
@@ -344,10 +349,11 @@ public class UniversalImageGen(
                 return null;
             }
 
+            // ContentLength 可能为 null（如 chunked 传输），仅在已知时做预检
             var contentLength = resp.Content.Headers.ContentLength;
-            if (contentLength > MaxDownloadBytes)
+            if (contentLength.HasValue && contentLength.Value > MaxDownloadBytes)
             {
-                Poke($"图片过大 ({contentLength / 1024.0 / 1024:F1}MB)，限制为 {MaxDownloadBytes / 1024 / 1024}MB");
+                Poke($"图片过大 ({contentLength.Value / 1024.0 / 1024:F1}MB)，限制为 {MaxDownloadBytes / 1024 / 1024}MB");
                 return null;
             }
 
@@ -368,7 +374,7 @@ public class UniversalImageGen(
         }
     }
 
-    static async Task<string> DetectExtensionAsync(string url, byte[] data)
+    static string DetectExtension(string url, byte[] data)
     {
         try
         {
@@ -408,6 +414,41 @@ public class UniversalImageGen(
     }
 
     // ==============================
+    // 公共辅助
+    // ==============================
+
+    static async Task<string> ReadImageAsDataUriAsync(string imgPath)
+    {
+        var b64 = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
+        var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
+        return $"data:image/{ext};base64,{b64}";
+    }
+
+    async Task<(string raw, JsonNode node)?> SendRequestAsync(HttpRequestMessage req, string label)
+    {
+        using var resp = await _http.SendAsync(req);
+        var raw = await resp.Content.ReadAsStringAsync();
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            var code = (int)resp.StatusCode;
+            Log($"{label} 请求失败 (HTTP {code}): {(raw.Length > 200 ? raw[..200] + "..." : raw)}");
+            if (code >= 500)
+                throw new HttpRequestException($"服务端错误 ({code})", null, resp.StatusCode);
+            return null;
+        }
+
+        var node = JsonNode.Parse(raw);
+        if (node == null)
+        {
+            Log($"{label} 响应解析失败: 返回空节点");
+            return null;
+        }
+
+        return (raw, node);
+    }
+
+    // ==============================
     // API 调用
     // ==============================
 
@@ -423,15 +464,14 @@ public class UniversalImageGen(
             var msg = new JsonObject { ["role"] = "user" };
             if (imgPath != null)
             {
-                var b64data = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
-                var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
+                var dataUri = await ReadImageAsDataUriAsync(imgPath);
                 msg["content"] = new JsonArray
                 {
                     new JsonObject { ["type"] = "text", ["text"] = prompt },
                     new JsonObject
                     {
                         ["type"] = "image_url",
-                        ["image_url"] = new JsonObject { ["url"] = $"data:image/{ext};base64,{b64data}" }
+                        ["image_url"] = new JsonObject { ["url"] = dataUri }
                     }
                 };
             }
@@ -458,32 +498,15 @@ public class UniversalImageGen(
 
             if (imgPath != null)
             {
-                var b64img = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
-                var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
-                body["image"] = $"data:image/{ext};base64,{b64img}";
+                body["image"] = await ReadImageAsDataUriAsync(imgPath);
             }
 
             req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
         }
 
-        using var resp = await _http.SendAsync(req);
-        var raw = await resp.Content.ReadAsStringAsync();
-
-        if (!resp.IsSuccessStatusCode)
-        {
-            var code = (int)resp.StatusCode;
-            Log($"请求失败 (HTTP {code}): {(raw.Length > 200 ? raw[..200] + "..." : raw)}");
-            if (code >= 500)
-                throw new HttpRequestException($"服务端错误 ({code})", null, resp.StatusCode);
-            return null;
-        }
-
-        var node = JsonNode.Parse(raw);
-        if (node == null)
-        {
-            Log("响应解析失败: 返回空节点");
-            return null;
-        }
+        var result = await SendRequestAsync(req, "OpenAI");
+        if (result == null) return null;
+        var (raw, node) = result.Value;
 
         if (isChat)
         {
@@ -548,27 +571,16 @@ public class UniversalImageGen(
 
         if (imgPath != null)
         {
-            var b64 = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
-            var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
-            body["extra_body"]!["image"] = new JsonArray { $"data:image/{ext};base64,{b64}" };
+            var dataUri = await ReadImageAsDataUriAsync(imgPath);
+            body["extra_body"]!["image"] = new JsonArray { dataUri };
         }
 
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
 
-        using var resp = await _http.SendAsync(req);
-        var raw = await resp.Content.ReadAsStringAsync();
+        var result = await SendRequestAsync(req, "Agnes");
+        if (result == null) return null;
+        var (_, node) = result.Value;
 
-        if (!resp.IsSuccessStatusCode)
-        {
-            var code = (int)resp.StatusCode;
-            Log($"请求失败 (HTTP {code}): {(raw.Length > 200 ? raw[..200] + "..." : raw)}");
-            if (code >= 500)
-                throw new HttpRequestException($"服务端错误 ({code})", null, resp.StatusCode);
-            return null;
-        }
-
-        var node = JsonNode.Parse(raw);
-        if (node == null) return null;
         var agUrl = node["data"]?[0]?["url"]?.GetValue<string>();
         if (!string.IsNullOrWhiteSpace(agUrl)) return agUrl;
         var agB64 = node["data"]?[0]?["b64_json"]?.GetValue<string>();
@@ -592,9 +604,8 @@ public class UniversalImageGen(
         var contentList = new JsonArray();
         if (imgPath != null)
         {
-            var b64 = Convert.ToBase64String(await File.ReadAllBytesAsync(imgPath));
-            var ext = Path.GetExtension(imgPath)?.TrimStart('.').ToLowerInvariant() ?? "png";
-            contentList.Add(new JsonObject { ["image"] = $"data:image/{ext};base64,{b64}" });
+            var dataUri = await ReadImageAsDataUriAsync(imgPath);
+            contentList.Add(new JsonObject { ["image"] = dataUri });
         }
         contentList.Add(new JsonObject { ["text"] = prompt });
 
@@ -622,30 +633,17 @@ public class UniversalImageGen(
 
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
 
-        using var resp = await _http.SendAsync(req);
-        var raw = await resp.Content.ReadAsStringAsync();
+        var result = await SendRequestAsync(req, "Wan");
+        if (result == null) return null;
+        var (_, node) = result.Value;
 
-        if (!resp.IsSuccessStatusCode)
-        {
-            var code = (int)resp.StatusCode;
-            Log($"Wan 请求失败 (HTTP {code}): {(raw.Length > 200 ? raw[..200] + "..." : raw)}");
-            if (code >= 500)
-                throw new HttpRequestException($"服务端错误 ({code})", null, resp.StatusCode);
-            return null;
-        }
-
-        var node = JsonNode.Parse(raw);
-        if (node == null)
-        {
-            Log("Wan 响应解析失败: 返回空节点");
-            return null;
-        }
         var imageUrl = node["output"]?["choices"]?[0]?["message"]?["content"]?[0]?["image"]?.GetValue<string>();
         if (!string.IsNullOrWhiteSpace(imageUrl))
             return imageUrl;
         var taskStatus = node["output"]?["task_status"]?.GetValue<string>();
         if (taskStatus != null)
             Log($"Wan 任务状态: {taskStatus}");
+        var raw = result.Value.raw;
         var preview = raw.Length > 300 ? raw[..300] + "..." : raw;
         Log($"Wan 响应未找到图片: {preview}");
         return null;
